@@ -42,6 +42,10 @@ pub struct SkillsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<NonZeroUsize>,
 
+    /// Replaces all automatically discovered skill roots when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_roots: Option<Vec<AbsolutePathBuf>>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<SkillConfig>,
 }

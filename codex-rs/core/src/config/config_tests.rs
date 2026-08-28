@@ -374,6 +374,7 @@ enabled = false
             bundled: Some(BundledSkillsConfig { enabled: false }),
             include_instructions: Some(false),
             max_context_tokens: std::num::NonZeroUsize::new(1_200),
+            exclusive_roots: None,
             config: Vec::new(),
         })
     );

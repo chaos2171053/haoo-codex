@@ -226,6 +226,36 @@ fn write_skill(root: &AbsolutePathBuf, directory: &str, name: &str) -> AbsoluteP
     .expect("absolute skill path")
 }
 
+#[tokio::test]
+async fn exclusive_roots_skip_every_automatic_skill_source() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let home = absolute(temp_dir.path().join("home"));
+    let codex_home = home.join("codex");
+    let repository = absolute(temp_dir.path().join("repo"));
+    let exclusive_root = repository.join("skills");
+    let path = toml::Value::String(exclusive_root.display().to_string());
+    let session_config = toml::from_str(&format!("[skills]\nexclusive_roots = [{path}]\n"))
+        .expect("valid session config");
+    let config_stack = stack(vec![
+        user_layer(&codex_home),
+        ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, session_config),
+    ]);
+
+    let roots = resolve_skill_roots_with_home_dir(
+        Some(Arc::clone(&LOCAL_FS)),
+        &config_stack,
+        &repository,
+        Some(&home),
+        Vec::new(),
+        vec![codex_home.join("extra-skills")],
+    )
+    .await;
+
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].path, exclusive_root);
+    assert_eq!(roots[0].scope, SkillScope::User);
+}
+
 fn expected_skill(path: AbsolutePathBuf, name: &str, scope: SkillScope) -> SkillMetadata {
     SkillMetadata {
         name: name.to_string(),

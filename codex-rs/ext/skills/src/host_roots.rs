@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
+use codex_config::SkillsConfig;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
@@ -53,6 +54,18 @@ async fn resolve_skill_roots_with_home_dir(
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
 ) -> Vec<HostSkillRoot> {
+    let exclusive_roots = config_layer_stack
+        .effective_config()
+        .get("skills")
+        .cloned()
+        .and_then(|value| SkillsConfig::try_from(value).ok())
+        .and_then(|skills| skills.exclusive_roots);
+    if let Some(exclusive_roots) = exclusive_roots {
+        return exclusive_roots
+            .into_iter()
+            .map(|path| local_root(path, SkillScope::User))
+            .collect();
+    }
     let mut roots =
         roots_from_layer_stack(config_layer_stack, home_dir, repository_file_system.clone());
     roots.extend(

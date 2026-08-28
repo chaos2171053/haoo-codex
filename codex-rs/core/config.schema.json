@@ -3456,6 +3456,13 @@
           },
           "type": "array"
         },
+        "exclusive_roots": {
+          "description": "Replaces all automatically discovered skill roots when set.",
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          },
+          "type": "array"
+        },
         "include_instructions": {
           "description": "Whether turns receive the automatic skills instructions block.",
           "type": "boolean"

@@ -213,7 +213,7 @@ impl ToolCallRuntime {
         FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
     }
 
-    fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
+    pub(crate) fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
         let message = err.to_string();
         match call.payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {

@@ -664,6 +664,9 @@
             "default_mode_request_user_input": {
               "type": "boolean"
             },
+            "default_mode_task_contract": {
+              "type": "boolean"
+            },
             "deferred_executor": {
               "type": "boolean"
             },
@@ -5675,6 +5678,9 @@
           "type": "boolean"
         },
         "default_mode_request_user_input": {
+          "type": "boolean"
+        },
+        "default_mode_task_contract": {
           "type": "boolean"
         },
         "deferred_executor": {

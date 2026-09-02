@@ -275,6 +275,8 @@ pub enum Feature {
     MentionsV2,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
+    /// Require an independently reviewed task contract before Default mode work.
+    DefaultModeTaskContract,
     /// Removed compatibility flag for model-enabled async user messaging.
     SendAsyncMessage,
     /// Enable automatic review for approval prompts.
@@ -1396,6 +1398,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::DefaultModeRequestUserInput,
         key: "default_mode_request_user_input",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::DefaultModeTaskContract,
+        key: "default_mode_task_contract",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

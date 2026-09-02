@@ -13,6 +13,7 @@ use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::tool_log_payload;
 use codex_memories_read::citations::parse_memory_citation;
@@ -197,6 +198,7 @@ pub(crate) type InFlightFuture<'f> =
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
     pub needs_follow_up: bool,
+    pub pending_tool_call: Option<Box<ToolCall>>,
     pub tool_future: Option<InFlightFuture<'static>>,
 }
 
@@ -206,6 +208,7 @@ pub(crate) struct HandleOutputCtx {
     pub turn_store: Arc<ExtensionData>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub defer_tool_execution: bool,
 }
 
 pub(crate) async fn apply_turn_item_contributors(
@@ -316,15 +319,18 @@ pub(crate) async fn handle_output_item_done(
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
-            let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
-
             output.needs_follow_up = true;
-            output.tool_future = Some(tool_future);
+            if ctx.defer_tool_execution {
+                output.pending_tool_call = Some(Box::new(call));
+            } else {
+                let cancellation_token = ctx.cancellation_token.child_token();
+                let tool_future: InFlightFuture<'static> = Box::pin(
+                    ctx.tool_runtime
+                        .clone()
+                        .handle_tool_call(call, cancellation_token),
+                );
+                output.tool_future = Some(tool_future);
+            }
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {

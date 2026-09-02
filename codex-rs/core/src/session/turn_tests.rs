@@ -86,3 +86,55 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         Some("plan contributed assistant text")
     );
 }
+
+#[test]
+fn clarification_only_accepts_successful_control_tool_output() {
+    let output = |success| ResponseInputItem::FunctionCallOutput {
+        call_id: "submit-understanding".to_string(),
+        output: codex_protocol::models::FunctionCallOutputPayload {
+            body: codex_protocol::models::FunctionCallOutputBody::Text(String::new()),
+            success: Some(success),
+        },
+    };
+
+    assert!(tool_call_output_succeeded(&output(true)));
+    assert!(!tool_call_output_succeeded(&output(false)));
+}
+
+#[test]
+fn clarification_decision_retry_is_bounded() {
+    let mut retries = ClarificationRetryState::default();
+    update_clarification_decision_retries(true, false, false, false, &mut retries)
+        .expect("the first missing decision should be retried");
+    assert_eq!(retries.missing_decisions, 1);
+
+    let err = update_clarification_decision_retries(true, false, false, false, &mut retries)
+        .expect_err("a repeated missing decision should stop the turn");
+    assert!(err.to_string().contains("repeatedly skipped"));
+
+    update_clarification_decision_retries(true, true, false, false, &mut retries)
+        .expect("a valid question should reset the retry counter");
+    assert_eq!(retries.missing_decisions, 0);
+}
+
+#[test]
+fn rejected_task_contract_can_return_to_clarification_before_being_bounded() {
+    let mut retries = ClarificationRetryState::default();
+    update_clarification_decision_retries(true, false, true, false, &mut retries)
+        .expect("the first rejected contract should return reviewer feedback");
+    update_clarification_decision_retries(true, false, true, false, &mut retries)
+        .expect("the second rejected contract should still allow a user question");
+    update_clarification_decision_retries(true, true, false, false, &mut retries)
+        .expect("a valid question should reset rejected contract retries");
+
+    for attempt in 0..=REJECTED_TASK_CONTRACT_RETRY_LIMIT {
+        let result =
+            update_clarification_decision_retries(true, false, true, false, &mut retries);
+        if attempt < REJECTED_TASK_CONTRACT_RETRY_LIMIT {
+            result.expect("rejected contract should return feedback before the limit");
+        } else {
+            let err = result.expect_err("repeated rejected contracts should stop the turn");
+            assert!(err.to_string().contains("unsupported task contracts"));
+        }
+    }
+}

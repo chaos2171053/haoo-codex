@@ -295,6 +295,7 @@ async fn schedule_startup_prewarm_inner(
             text: base_instructions,
             provenance: None,
         },
+        false,
     );
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_prompt",

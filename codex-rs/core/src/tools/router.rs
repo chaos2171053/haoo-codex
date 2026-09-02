@@ -110,6 +110,15 @@ impl ToolRouter {
         Arc::clone(&self.model_visible_specs)
     }
 
+    pub(crate) fn model_visible_specs_matching(&self, names: &[&str]) -> Arc<[ToolSpec]> {
+        self.model_visible_specs
+            .iter()
+            .filter(|spec| names.contains(&spec.name()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         self.registry.deferred_tool_namespaces()
     }

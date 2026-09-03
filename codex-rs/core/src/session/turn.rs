@@ -145,14 +145,14 @@ const USER_INPUT_REQUIRED_MESSAGE: &str =
     "not executed because request_user_input requires a new model response after the user's answer";
 const CLARIFICATION_DECISION_REQUIRED_MESSAGE: &str = "the task boundary is still locked; ask the user for the missing decision or call submit_task_contract with the result, boundary, completion condition, and supporting user evidence";
 const CLARIFICATION_DECISION_RETRY_LIMIT: u8 = 1;
-const REJECTED_TASK_CONTRACT_RETRY_LIMIT: u8 = 2;
-const INVALID_TASK_CONTRACT_RETRY_LIMIT: u8 = 2;
+const REJECTED_TASK_CANDIDATE_RETRY_LIMIT: u8 = 2;
+const INVALID_TASK_CANDIDATE_RETRY_LIMIT: u8 = 2;
 const CLARIFICATION_DECISION_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly skipped the required decision";
-const TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly submitted unsupported task contracts";
-const INVALID_TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because task contract submissions repeatedly failed validation or review execution";
+const TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly proposed unsupported task candidates";
+const INVALID_TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because task candidates repeatedly failed validation or review execution";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskContractSubmission {
+enum TaskCandidateReview {
     NotAttempted,
     Invalid,
     NeedsClarification,
@@ -162,8 +162,8 @@ enum TaskContractSubmission {
 #[derive(Default)]
 struct ClarificationRetryState {
     missing_decisions: u8,
-    rejected_contracts: u8,
-    invalid_contracts: u8,
+    rejected_candidates: u8,
+    invalid_candidates: u8,
 }
 
 fn is_request_user_input_call(call: &ToolCall) -> bool {
@@ -187,41 +187,42 @@ fn task_contract_gate_enabled(turn_context: &TurnContext) -> bool {
             .enabled(Feature::DefaultModeTaskContract)
 }
 
-fn is_final_assistant_message(item: &ResponseItem) -> bool {
+fn should_defer_assistant_message(item: &ResponseItem, clarification_active: bool) -> bool {
     matches!(
         item,
         ResponseItem::Message { role, phase, .. }
-            if role == "assistant" && !matches!(phase, Some(MessagePhase::Commentary))
+            if role == "assistant"
+                && (clarification_active || !matches!(phase, Some(MessagePhase::Commentary)))
     )
 }
 
 fn update_clarification_decision_retries(
     clarification_active: bool,
     requested_user_input: bool,
-    task_contract_submission: TaskContractSubmission,
+    task_candidate_review: TaskCandidateReview,
     retries: &mut ClarificationRetryState,
 ) -> CodexResult<()> {
     if !clarification_active
         || requested_user_input
-        || task_contract_submission == TaskContractSubmission::Accepted
+        || task_candidate_review == TaskCandidateReview::Accepted
     {
         *retries = ClarificationRetryState::default();
-    } else if task_contract_submission == TaskContractSubmission::NeedsClarification {
+    } else if task_candidate_review == TaskCandidateReview::NeedsClarification {
         retries.missing_decisions = 0;
-        if retries.rejected_contracts >= REJECTED_TASK_CONTRACT_RETRY_LIMIT {
+        if retries.rejected_candidates >= REJECTED_TASK_CANDIDATE_RETRY_LIMIT {
             return Err(CodexErr::InvalidRequest(
-                TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE.to_string(),
+                TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE.to_string(),
             ));
         }
-        retries.rejected_contracts += 1;
-    } else if task_contract_submission == TaskContractSubmission::Invalid {
+        retries.rejected_candidates += 1;
+    } else if task_candidate_review == TaskCandidateReview::Invalid {
         retries.missing_decisions = 0;
-        if retries.invalid_contracts >= INVALID_TASK_CONTRACT_RETRY_LIMIT {
+        if retries.invalid_candidates >= INVALID_TASK_CANDIDATE_RETRY_LIMIT {
             return Err(CodexErr::InvalidRequest(
-                INVALID_TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE.to_string(),
+                INVALID_TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE.to_string(),
             ));
         }
-        retries.invalid_contracts += 1;
+        retries.invalid_candidates += 1;
     } else {
         if retries.missing_decisions >= CLARIFICATION_DECISION_RETRY_LIMIT {
             return Err(CodexErr::InvalidRequest(
@@ -497,17 +498,17 @@ pub(crate) async fn run_turn(
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                     requested_user_input,
-                    task_contract_submission,
+                    task_candidate_review,
                 } = sampling_request_output;
                 update_clarification_decision_retries(
                     clarification_active,
                     requested_user_input,
-                    task_contract_submission,
+                    task_candidate_review,
                     &mut clarification_decision_retries,
                 )?;
                 if requested_user_input {
                     clarification_active = true;
-                } else if task_contract_submission == TaskContractSubmission::Accepted {
+                } else if task_candidate_review == TaskCandidateReview::Accepted {
                     clarification_active = false;
                 }
                 if model_needs_follow_up {
@@ -1710,7 +1711,7 @@ struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
     requested_user_input: bool,
-    task_contract_submission: TaskContractSubmission,
+    task_candidate_review: TaskCandidateReview,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2292,7 +2293,7 @@ async fn drain_in_flight(
 
 struct ClarificationResponseResult {
     requested_user_input: bool,
-    task_contract_submission: TaskContractSubmission,
+    task_candidate_review: TaskCandidateReview,
     decision_missing: bool,
     last_agent_message: Option<String>,
 }
@@ -2300,11 +2301,11 @@ struct ClarificationResponseResult {
 #[derive(Default)]
 struct DeferredResponseState {
     tool_calls: Vec<ToolCall>,
-    final_messages: Vec<ResponseItem>,
+    assistant_messages: Vec<ResponseItem>,
 }
 
-fn record_pending_final_messages(
-    pending_final_messages: Vec<ResponseItem>,
+fn record_pending_assistant_messages(
+    pending_assistant_messages: Vec<ResponseItem>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     turn_store: Arc<ExtensionData>,
@@ -2314,7 +2315,7 @@ fn record_pending_final_messages(
 ) -> BoxFuture<'static, CodexResult<Option<String>>> {
     Box::pin(async move {
         let mut last_agent_message = None;
-        for item in pending_final_messages {
+        for item in pending_assistant_messages {
             let mut ctx = HandleOutputCtx {
                 sess: sess.clone(),
                 turn_context: turn_context.clone(),
@@ -2343,7 +2344,7 @@ fn tool_call_output_succeeded(response: &ResponseInputItem) -> bool {
 
 fn finalize_clarification_response(
     pending_tool_calls: Vec<ToolCall>,
-    pending_final_messages: Vec<ResponseItem>,
+    pending_assistant_messages: Vec<ResponseItem>,
     clarification_active: bool,
     tool_runtime: ToolCallRuntime,
     cancellation_token: CancellationToken,
@@ -2408,10 +2409,10 @@ fn finalize_clarification_response(
             Some(turn_context.turn_timing_state.begin_tool_blocking())
         };
         let mut requested_user_input = false;
-        let mut task_contract_submission = if submit_task_contract_scheduled {
-            TaskContractSubmission::Invalid
+        let mut task_candidate_review = if submit_task_contract_scheduled {
+            TaskCandidateReview::Invalid
         } else {
-            TaskContractSubmission::NotAttempted
+            TaskCandidateReview::NotAttempted
         };
         while let Some((is_request_user_input, is_submit_task_contract, result)) =
             in_flight.next().await
@@ -2432,14 +2433,14 @@ fn finalize_clarification_response(
                             }
                             _ => None,
                         };
-                        task_contract_submission = if succeeded {
-                            TaskContractSubmission::Accepted
+                        task_candidate_review = if succeeded {
+                            TaskCandidateReview::Accepted
                         } else if assessment.is_some_and(|assessment| {
                             assessment.decision == TaskContractReviewDecision::Clarify
                         }) {
-                            TaskContractSubmission::NeedsClarification
+                            TaskCandidateReview::NeedsClarification
                         } else {
-                            TaskContractSubmission::Invalid
+                            TaskCandidateReview::Invalid
                         };
                     }
                     let response_item = response_input.into();
@@ -2466,20 +2467,32 @@ fn finalize_clarification_response(
 
         let mut last_agent_message = None;
         let mut answer_allowed = false;
-        if !has_tool_calls && !pending_final_messages.is_empty() {
+        if !has_tool_calls && !pending_assistant_messages.is_empty() {
             if clarification_active {
-                let text = pending_final_messages
+                let text = pending_assistant_messages
                     .iter()
                     .filter_map(crate::stream_events_utils::raw_assistant_output_text_from_item)
                     .collect::<String>();
-                match crate::task_contract_review::audit_task_candidate(
+                let review_result = crate::task_contract_review::audit_task_candidate(
                     Arc::clone(&sess),
                     Arc::clone(&turn_context),
                     crate::task_contract_review::TaskCandidate::Answer { text },
                     cancellation_token.child_token(),
                 )
-                .await
-                .and_then(crate::task_contract_review::TaskContractAssessment::into_allowed)
+                .await;
+                task_candidate_review = match &review_result {
+                    Ok(assessment) => match assessment.decision {
+                        crate::task_contract_review::TaskContractReviewDecision::Allow => {
+                            TaskCandidateReview::Accepted
+                        }
+                        crate::task_contract_review::TaskContractReviewDecision::Clarify => {
+                            TaskCandidateReview::NeedsClarification
+                        }
+                    },
+                    Err(_) => TaskCandidateReview::Invalid,
+                };
+                match review_result
+                    .and_then(crate::task_contract_review::TaskContractAssessment::into_allowed)
                 {
                     Ok(()) => answer_allowed = true,
                     Err(message) => {
@@ -2502,8 +2515,8 @@ fn finalize_clarification_response(
             }
         }
         if answer_allowed {
-            last_agent_message = record_pending_final_messages(
-                pending_final_messages,
+            last_agent_message = record_pending_assistant_messages(
+                pending_assistant_messages,
                 Arc::clone(&sess),
                 Arc::clone(&turn_context),
                 turn_store,
@@ -2516,7 +2529,7 @@ fn finalize_clarification_response(
 
         let decision_missing = clarification_active
             && !requested_user_input
-            && task_contract_submission != TaskContractSubmission::Accepted
+            && task_candidate_review != TaskCandidateReview::Accepted
             && !answer_allowed;
         if decision_missing {
             let response_item = ResponseItem::Message {
@@ -2534,7 +2547,7 @@ fn finalize_clarification_response(
 
         Ok(ClarificationResponseResult {
             requested_user_input,
-            task_contract_submission,
+            task_candidate_review,
             decision_missing,
             last_agent_message,
         })
@@ -2741,9 +2754,11 @@ async fn try_run_sampling_request(
                 {
                     continue;
                 }
-                if defer_tool_execution && is_final_assistant_message(&item) {
+                if defer_tool_execution
+                    && should_defer_assistant_message(&item, clarification_active)
+                {
                     if let Some(state) = deferred_response.as_mut() {
-                        state.final_messages.push(item);
+                        state.assistant_messages.push(item);
                     }
                     continue;
                 }
@@ -2808,7 +2823,7 @@ async fn try_run_sampling_request(
                         needs_follow_up: true,
                         last_agent_message,
                         requested_user_input: false,
-                        task_contract_submission: TaskContractSubmission::NotAttempted,
+                        task_candidate_review: TaskCandidateReview::NotAttempted,
                     });
                 }
             }
@@ -2838,7 +2853,8 @@ async fn try_run_sampling_request(
                 {
                     let mut turn_item = turn_item;
                     let stream_item_to_client = !(defer_streamed_turn_items_for_contributors
-                        || defer_tool_execution && is_final_assistant_message(&item));
+                        || defer_tool_execution
+                            && should_defer_assistant_message(&item, clarification_active));
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -2958,12 +2974,12 @@ async fn try_run_sampling_request(
                     .as_ref()
                     .is_some_and(|state| state.tool_calls.iter().any(is_submit_task_contract_call));
                 if !waits_for_user_input && !submits_task_contract && !clarification_active {
-                    let final_messages = deferred_response
+                    let assistant_messages = deferred_response
                         .as_mut()
-                        .map(|state| std::mem::take(&mut state.final_messages))
+                        .map(|state| std::mem::take(&mut state.assistant_messages))
                         .unwrap_or_default();
-                    if let Some(agent_message) = record_pending_final_messages(
-                        final_messages,
+                    if let Some(agent_message) = record_pending_assistant_messages(
+                        assistant_messages,
                         sess.clone(),
                         turn_context.clone(),
                         Arc::clone(&turn_store),
@@ -3017,7 +3033,7 @@ async fn try_run_sampling_request(
                     needs_follow_up,
                     last_agent_message,
                     requested_user_input: false,
-                    task_contract_submission: TaskContractSubmission::NotAttempted,
+                    task_candidate_review: TaskCandidateReview::NotAttempted,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3183,7 +3199,7 @@ async fn try_run_sampling_request(
         let deferred_response = deferred_response.take().unwrap_or_default();
         let clarification_response = finalize_clarification_response(
             deferred_response.tool_calls,
-            deferred_response.final_messages,
+            deferred_response.assistant_messages,
             clarification_active,
             tool_runtime.clone(),
             cancellation_token.child_token(),
@@ -3194,7 +3210,7 @@ async fn try_run_sampling_request(
         .await?;
         if let Ok(result) = &mut outcome {
             result.requested_user_input = clarification_response.requested_user_input;
-            result.task_contract_submission = clarification_response.task_contract_submission;
+            result.task_candidate_review = clarification_response.task_candidate_review;
             result.needs_follow_up |= clarification_response.decision_missing;
             if clarification_response.last_agent_message.is_some() {
                 result.last_agent_message = clarification_response.last_agent_message;

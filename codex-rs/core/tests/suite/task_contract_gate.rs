@@ -2,6 +2,7 @@
 
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
@@ -11,6 +12,8 @@ use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_message_item_added;
+use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -21,6 +24,141 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
 use test_case::test_case;
+
+fn streamed_assistant_message(id: &str, text: &str, phase: Option<&str>) -> Vec<serde_json::Value> {
+    let mut added = ev_message_item_added(id, "");
+    let mut done = ev_assistant_message(id, text);
+    if let Some(phase) = phase {
+        added["item"]["phase"] = json!(phase);
+        done["item"]["phase"] = json!(phase);
+    }
+    vec![added, ev_output_text_delta(text), done]
+}
+
+fn assert_no_assistant_message(event: &EventMsg) {
+    match event {
+        EventMsg::AgentMessage(_) | EventMsg::AgentMessageContentDelta(_) => {
+            panic!("unreviewed message was shown: {event:?}")
+        }
+        EventMsg::ItemStarted(event) if matches!(event.item, TurnItem::AgentMessage(_)) => {
+            panic!("unreviewed message was started: {event:?}")
+        }
+        EventMsg::ItemCompleted(event) if matches!(event.item, TurnItem::AgentMessage(_)) => {
+            panic!("unreviewed message was completed: {event:?}")
+        }
+        _ => {}
+    }
+}
+
+#[test_case("allow", None; "revised question is shown")]
+#[test_case(
+    "clarify",
+    Some("clarification could not be completed because the model repeatedly proposed unsupported task candidates");
+    "rejections stop with their actual reason"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_contract_answer_review_preserves_revision_state(
+    final_decision: &str,
+    expected_error: Option<&str>,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    const QUESTION: &str = "What scope would you like me to assess?";
+
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .unwrap();
+            config
+                .features
+                .enable(Feature::DefaultModeTaskContract)
+                .unwrap();
+        })
+        .build(&server)
+        .await?;
+
+    let mut candidate_mocks = Vec::new();
+    for round in 0..3 {
+        let candidate = if round == 2 {
+            QUESTION
+        } else {
+            "I will assess the whole organization over five years."
+        };
+        candidate_mocks.push(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_assistant_message(&format!("candidate-{round}"), candidate),
+                    ev_completed(&format!("main-{round}")),
+                ]),
+            )
+            .await,
+        );
+        let decision = if round == 2 {
+            final_decision
+        } else {
+            "clarify"
+        };
+        let unsupported_decisions = if decision == "allow" {
+            vec![]
+        } else {
+            vec!["The user has not established the proposed scope."]
+        };
+        responses::mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message(
+                    &format!("assessment-{round}"),
+                    &json!({"decision": decision, "unsupported_decisions": unsupported_decisions})
+                        .to_string(),
+                ),
+                ev_completed(&format!("review-{round}")),
+            ]),
+        )
+        .await;
+    }
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Assess this proposal.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let mut messages = Vec::new();
+    let completion = loop {
+        match test.codex.next_event().await?.msg {
+            EventMsg::TurnComplete(completion) => break completion,
+            EventMsg::AgentMessage(message) => messages.push(message.message),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        completion
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        expected_error
+    );
+    assert_eq!(
+        messages,
+        if expected_error.is_none() {
+            vec![QUESTION.to_string()]
+        } else {
+            vec![]
+        }
+    );
+    for candidate in candidate_mocks.iter().skip(1) {
+        assert!(
+            candidate
+                .single_request()
+                .body_contains_text("The user has not established the proposed scope.")
+        );
+    }
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::Result<()> {
@@ -216,28 +354,36 @@ async fn task_contract_clarification_completes_before_work_starts(
     .await;
     let question_mock = responses::mount_sse_once(
         &server,
-        sse(vec![
-            ev_function_call(
-                "clarify-scope",
-                "request_user_input",
-                &json!({
-                    "questions": [{
-                        "id": "scope",
-                        "header": "Scope",
-                        "question": "What scope and deliverable do you want?",
-                        "options": [{
-                            "label": "Focused review (Recommended)",
-                            "description": "Assess only the named proposal."
-                        }, {
-                            "label": "Full report",
-                            "description": "Define a broader report before work starts."
-                        }]
-                    }]
-                })
-                .to_string(),
+        sse([
+            streamed_assistant_message(
+                "unsupported-plan",
+                "I will deliver a five-year full report.",
+                Some("commentary"),
             ),
-            ev_completed("main-question"),
-        ]),
+            vec![
+                ev_function_call(
+                    "clarify-scope",
+                    "request_user_input",
+                    &json!({
+                        "questions": [{
+                            "id": "scope",
+                            "header": "Scope",
+                            "question": "What scope and deliverable do you want?",
+                            "options": [{
+                                "label": "Focused review (Recommended)",
+                                "description": "Assess only the named proposal."
+                            }, {
+                                "label": "Full report",
+                                "description": "Define a broader report before work starts."
+                            }]
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ev_completed("main-question"),
+            ],
+        ]
+        .concat()),
     )
     .await;
 
@@ -249,7 +395,10 @@ async fn task_contract_clarification_completes_before_work_starts(
         .await?;
     let question = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RequestUserInput(question) => Some(question.clone()),
-        _ => None,
+        _ => {
+            assert_no_assistant_message(event);
+            None
+        }
     })
     .await;
 
@@ -327,10 +476,18 @@ async fn task_contract_clarification_completes_before_work_starts(
     .await;
     let work_mock = responses::mount_sse_once(
         &server,
-        sse(vec![
-            ev_function_call("work-call", "test_sync_tool", "{}"),
-            ev_completed("work"),
-        ]),
+        sse([
+            streamed_assistant_message(
+                "reviewed-progress",
+                "I am assessing the named proposal.",
+                Some("commentary"),
+            ),
+            vec![
+                ev_function_call("work-call", "test_sync_tool", "{}"),
+                ev_completed("work"),
+            ],
+        ]
+        .concat()),
     )
     .await;
     let final_mock = responses::mount_sse_once(
@@ -355,10 +512,19 @@ async fn task_contract_clarification_completes_before_work_starts(
             },
         })
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    let mut progress_shown = false;
+    loop {
+        let event = test.codex.next_event().await?.msg;
+        match event {
+            EventMsg::TurnComplete(_) => break,
+            EventMsg::AgentMessage(message) => {
+                progress_shown |= message.message == "I am assessing the named proposal.";
+                assert!(!message.message.contains("five-year"));
+            }
+            _ => {}
+        }
+    }
+    assert!(progress_shown, "reviewed work progress must remain visible");
     assert!(
         clarified_mock
             .single_request()
@@ -383,8 +549,11 @@ async fn task_contract_clarification_completes_before_work_starts(
     Ok(())
 }
 
+#[test_case(None; "untagged")]
+#[test_case(Some("final_answer"); "final answer")]
+#[test_case(Some("commentary"); "commentary")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_direct_answer_is_not_shown() -> anyhow::Result<()> {
+async fn unsupported_direct_answer_is_not_shown(phase: Option<&str>) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -405,13 +574,15 @@ async fn unsupported_direct_answer_is_not_shown() -> anyhow::Result<()> {
 
     responses::mount_sse_once(
         &server,
-        sse(vec![
-            ev_assistant_message(
+        sse([
+            streamed_assistant_message(
                 "unsupported-answer",
                 "I will deliver a five-year full report.",
+                phase,
             ),
-            ev_completed("main-answer"),
-        ]),
+            vec![ev_completed("main-answer")],
+        ]
+        .concat()),
     )
     .await;
     responses::mount_sse_once(
@@ -461,10 +632,7 @@ async fn unsupported_direct_answer_is_not_shown() -> anyhow::Result<()> {
     loop {
         match test.codex.next_event().await?.msg {
             EventMsg::RequestUserInput(_) => break,
-            EventMsg::AgentMessage(message) => {
-                panic!("unsupported answer was shown: {}", message.message)
-            }
-            _ => {}
+            event => assert_no_assistant_message(&event),
         }
     }
     test.codex.submit(Op::Interrupt).await?;

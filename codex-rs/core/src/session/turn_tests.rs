@@ -107,7 +107,7 @@ fn clarification_decision_retry_is_bounded() {
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::NotAttempted,
+        TaskCandidateReview::NotAttempted,
         &mut retries,
     )
     .expect("the first missing decision should be retried");
@@ -116,7 +116,7 @@ fn clarification_decision_retry_is_bounded() {
     let err = update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::NotAttempted,
+        TaskCandidateReview::NotAttempted,
         &mut retries,
     )
     .expect_err("a repeated missing decision should stop the turn");
@@ -125,7 +125,7 @@ fn clarification_decision_retry_is_bounded() {
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ true,
-        TaskContractSubmission::NotAttempted,
+        TaskCandidateReview::NotAttempted,
         &mut retries,
     )
     .expect("a valid question should reset the retry counter");
@@ -138,37 +138,37 @@ fn rejected_task_contract_can_return_to_clarification_before_being_bounded() {
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::NeedsClarification,
+        TaskCandidateReview::NeedsClarification,
         &mut retries,
     )
     .expect("the first rejected contract should return reviewer feedback");
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::NeedsClarification,
+        TaskCandidateReview::NeedsClarification,
         &mut retries,
     )
     .expect("the second rejected contract should still allow a user question");
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ true,
-        TaskContractSubmission::NotAttempted,
+        TaskCandidateReview::NotAttempted,
         &mut retries,
     )
     .expect("a valid question should reset rejected contract retries");
 
-    for attempt in 0..=REJECTED_TASK_CONTRACT_RETRY_LIMIT {
+    for attempt in 0..=REJECTED_TASK_CANDIDATE_RETRY_LIMIT {
         let result = update_clarification_decision_retries(
             /*clarification_active*/ true,
             /*requested_user_input*/ false,
-            TaskContractSubmission::NeedsClarification,
+            TaskCandidateReview::NeedsClarification,
             &mut retries,
         );
-        if attempt < REJECTED_TASK_CONTRACT_RETRY_LIMIT {
+        if attempt < REJECTED_TASK_CANDIDATE_RETRY_LIMIT {
             result.expect("rejected contract should return feedback before the limit");
         } else {
             let err = result.expect_err("repeated rejected contracts should stop the turn");
-            assert!(err.to_string().contains("unsupported task contracts"));
+            assert!(err.to_string().contains("unsupported task candidates"));
         }
     }
 }
@@ -176,11 +176,11 @@ fn rejected_task_contract_can_return_to_clarification_before_being_bounded() {
 #[test]
 fn invalid_task_contract_retries_are_bounded_independently_of_review_rejections() {
     let mut retries = ClarificationRetryState::default();
-    for _ in 0..INVALID_TASK_CONTRACT_RETRY_LIMIT {
+    for _ in 0..INVALID_TASK_CANDIDATE_RETRY_LIMIT {
         update_clarification_decision_retries(
             /*clarification_active*/ true,
             /*requested_user_input*/ false,
-            TaskContractSubmission::Invalid,
+            TaskCandidateReview::Invalid,
             &mut retries,
         )
         .expect("invalid submissions should receive bounded repair feedback");
@@ -188,14 +188,14 @@ fn invalid_task_contract_retries_are_bounded_independently_of_review_rejections(
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::NeedsClarification,
+        TaskCandidateReview::NeedsClarification,
         &mut retries,
     )
     .expect("a first review rejection must allow clarification after format repairs");
     let err = update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ false,
-        TaskContractSubmission::Invalid,
+        TaskCandidateReview::Invalid,
         &mut retries,
     )
     .expect_err("a review rejection must not replenish the invalid submission budget");
@@ -207,12 +207,12 @@ fn invalid_task_contract_retries_are_bounded_independently_of_review_rejections(
     update_clarification_decision_retries(
         /*clarification_active*/ true,
         /*requested_user_input*/ true,
-        TaskContractSubmission::NotAttempted,
+        TaskCandidateReview::NotAttempted,
         &mut retries,
     )
     .expect("a user answer resets both budgets");
     assert_eq!(
-        (retries.invalid_contracts, retries.rejected_contracts),
+        (retries.invalid_candidates, retries.rejected_candidates),
         (0, 0)
     );
 }

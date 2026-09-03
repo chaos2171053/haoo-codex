@@ -14,6 +14,7 @@ use crate::connectors;
 use crate::context::ContextualUserFragment;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
+use crate::function_tool::FunctionCallError;
 use crate::hook_runtime::drain_async_hook_results;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -50,8 +51,11 @@ use crate::stream_events_utils::record_completed_response_item_with_finalized_fa
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::handlers::request_user_input_spec::REQUEST_USER_INPUT_TOOL_NAME;
+use crate::tools::handlers::submit_task_contract_spec::SUBMIT_TASK_CONTRACT_TOOL_NAME;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
 use crate::tools::spec_plan::build_tool_router;
@@ -137,6 +141,98 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
+const USER_INPUT_REQUIRED_MESSAGE: &str =
+    "not executed because request_user_input requires a new model response after the user's answer";
+const CLARIFICATION_DECISION_REQUIRED_MESSAGE: &str = "the task boundary is still locked; ask the user for the missing decision or call submit_task_contract with the result, boundary, completion condition, and supporting user evidence";
+const CLARIFICATION_DECISION_RETRY_LIMIT: u8 = 1;
+const REJECTED_TASK_CANDIDATE_RETRY_LIMIT: u8 = 2;
+const INVALID_TASK_CANDIDATE_RETRY_LIMIT: u8 = 2;
+const CLARIFICATION_DECISION_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly skipped the required decision";
+const TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly proposed unsupported task candidates";
+const INVALID_TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because task candidates repeatedly failed validation or review execution";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCandidateReview {
+    NotAttempted,
+    Invalid,
+    NeedsClarification,
+    Accepted,
+}
+
+#[derive(Default)]
+struct ClarificationRetryState {
+    missing_decisions: u8,
+    rejected_candidates: u8,
+    invalid_candidates: u8,
+}
+
+fn is_request_user_input_call(call: &ToolCall) -> bool {
+    call.tool_name.is_default_namespace() && call.tool_name.name == REQUEST_USER_INPUT_TOOL_NAME
+}
+
+fn is_submit_task_contract_call(call: &ToolCall) -> bool {
+    call.tool_name.is_default_namespace() && call.tool_name.name == SUBMIT_TASK_CONTRACT_TOOL_NAME
+}
+
+fn task_contract_gate_enabled(turn_context: &TurnContext) -> bool {
+    turn_context.mode == ModeKind::Default
+        && turn_context.config.experimental_request_user_input_enabled
+        && turn_context
+            .config
+            .features
+            .enabled(Feature::DefaultModeRequestUserInput)
+        && turn_context
+            .config
+            .features
+            .enabled(Feature::DefaultModeTaskContract)
+}
+
+fn should_defer_assistant_message(item: &ResponseItem, clarification_active: bool) -> bool {
+    matches!(
+        item,
+        ResponseItem::Message { role, phase, .. }
+            if role == "assistant"
+                && (clarification_active || !matches!(phase, Some(MessagePhase::Commentary)))
+    )
+}
+
+fn update_clarification_decision_retries(
+    clarification_active: bool,
+    requested_user_input: bool,
+    task_candidate_review: TaskCandidateReview,
+    retries: &mut ClarificationRetryState,
+) -> CodexResult<()> {
+    if !clarification_active
+        || requested_user_input
+        || task_candidate_review == TaskCandidateReview::Accepted
+    {
+        *retries = ClarificationRetryState::default();
+    } else if task_candidate_review == TaskCandidateReview::NeedsClarification {
+        retries.missing_decisions = 0;
+        if retries.rejected_candidates >= REJECTED_TASK_CANDIDATE_RETRY_LIMIT {
+            return Err(CodexErr::InvalidRequest(
+                TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE.to_string(),
+            ));
+        }
+        retries.rejected_candidates += 1;
+    } else if task_candidate_review == TaskCandidateReview::Invalid {
+        retries.missing_decisions = 0;
+        if retries.invalid_candidates >= INVALID_TASK_CANDIDATE_RETRY_LIMIT {
+            return Err(CodexErr::InvalidRequest(
+                INVALID_TASK_CANDIDATE_RETRY_EXHAUSTED_MESSAGE.to_string(),
+            ));
+        }
+        retries.invalid_candidates += 1;
+    } else {
+        if retries.missing_decisions >= CLARIFICATION_DECISION_RETRY_LIMIT {
+            return Err(CodexErr::InvalidRequest(
+                CLARIFICATION_DECISION_RETRY_EXHAUSTED_MESSAGE.to_string(),
+            ));
+        }
+        retries.missing_decisions += 1;
+    }
+    Ok(())
+}
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -286,6 +382,8 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut clarification_active = task_contract_gate_enabled(&turn_context);
+    let mut clarification_decision_retries = ClarificationRetryState::default();
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -380,7 +478,7 @@ pub(crate) async fn run_turn(
             let responses_metadata = sess
                 .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
                 .await;
-            run_sampling_request(
+            Box::pin(run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
                 Arc::clone(&turn_context.extension_data),
@@ -388,8 +486,9 @@ pub(crate) async fn run_turn(
                 &mut client_session,
                 &responses_metadata,
                 sampling_request_input,
+                clarification_active,
                 cancellation_token.child_token(),
-            )
+            ))
             .await
         }
         .await;
@@ -398,7 +497,20 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    requested_user_input,
+                    task_candidate_review,
                 } = sampling_request_output;
+                update_clarification_decision_retries(
+                    clarification_active,
+                    requested_user_input,
+                    task_candidate_review,
+                    &mut clarification_decision_retries,
+                )?;
+                if requested_user_input {
+                    clarification_active = true;
+                } else if task_candidate_review == TaskCandidateReview::Accepted {
+                    clarification_active = false;
+                }
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -1326,11 +1438,19 @@ pub(crate) fn build_prompt(
     input: Vec<ResponseItem>,
     step_context: &StepContext,
     base_instructions: BaseInstructions,
+    task_contract_locked: bool,
 ) -> Prompt {
     let turn_context = &step_context.turn;
     Prompt {
         input,
-        tools: step_context.tool_router.model_visible_specs(),
+        tools: if task_contract_locked {
+            step_context.tool_router.model_visible_specs_matching(&[
+                REQUEST_USER_INPUT_TOOL_NAME,
+                SUBMIT_TASK_CONTRACT_TOOL_NAME,
+            ])
+        } else {
+            step_context.tool_router.model_visible_specs()
+        },
         parallel_tool_calls: true,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
@@ -1358,6 +1478,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
+    clarification_active: bool,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -1397,8 +1518,9 @@ async fn run_sampling_request(
             prompt_input,
             step_context.as_ref(),
             base_instructions.clone(),
+            clarification_active,
         );
-        let err = match try_run_sampling_request(
+        let err = match Box::pin(try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&step_context),
@@ -1407,8 +1529,9 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            clarification_active,
             cancellation_token.child_token(),
-        )
+        ))
         .await
         {
             Ok(output) => {
@@ -1587,6 +1710,8 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    requested_user_input: bool,
+    task_candidate_review: TaskCandidateReview,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2166,6 +2291,269 @@ async fn drain_in_flight(
     Ok(())
 }
 
+struct ClarificationResponseResult {
+    requested_user_input: bool,
+    task_candidate_review: TaskCandidateReview,
+    decision_missing: bool,
+    last_agent_message: Option<String>,
+}
+
+#[derive(Default)]
+struct DeferredResponseState {
+    tool_calls: Vec<ToolCall>,
+    assistant_messages: Vec<ResponseItem>,
+}
+
+fn record_pending_assistant_messages(
+    pending_assistant_messages: Vec<ResponseItem>,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_store: Arc<ExtensionData>,
+    tool_runtime: ToolCallRuntime,
+    cancellation_token: CancellationToken,
+    defer_tool_execution: bool,
+) -> BoxFuture<'static, CodexResult<Option<String>>> {
+    Box::pin(async move {
+        let mut last_agent_message = None;
+        for item in pending_assistant_messages {
+            let mut ctx = HandleOutputCtx {
+                sess: sess.clone(),
+                turn_context: turn_context.clone(),
+                turn_store: Arc::clone(&turn_store),
+                tool_runtime: tool_runtime.clone(),
+                cancellation_token: cancellation_token.child_token(),
+                defer_tool_execution,
+            };
+            let output_result =
+                handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None).await?;
+            if let Some(agent_message) = output_result.last_agent_message {
+                last_agent_message = Some(agent_message);
+            }
+        }
+        Ok(last_agent_message)
+    })
+}
+
+fn tool_call_output_succeeded(response: &ResponseInputItem) -> bool {
+    match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => output.success == Some(true),
+        _ => true,
+    }
+}
+
+fn finalize_clarification_response(
+    pending_tool_calls: Vec<ToolCall>,
+    pending_assistant_messages: Vec<ResponseItem>,
+    clarification_active: bool,
+    tool_runtime: ToolCallRuntime,
+    cancellation_token: CancellationToken,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_store: Arc<ExtensionData>,
+) -> BoxFuture<'static, CodexResult<ClarificationResponseResult>> {
+    Box::pin(async move {
+        let has_request_user_input = pending_tool_calls.iter().any(is_request_user_input_call);
+        let has_tool_calls = !pending_tool_calls.is_empty();
+        let mut request_user_input_scheduled = false;
+        let mut submit_task_contract_scheduled = false;
+        let mut in_flight: FuturesOrdered<
+            BoxFuture<'static, (bool, bool, CodexResult<ResponseInputItem>)>,
+        > = FuturesOrdered::new();
+
+        for call in pending_tool_calls {
+            let is_request_user_input = is_request_user_input_call(&call);
+            let is_submit_task_contract = is_submit_task_contract_call(&call);
+            let execute_call = if has_request_user_input {
+                is_request_user_input && !request_user_input_scheduled
+            } else if clarification_active {
+                is_submit_task_contract && !submit_task_contract_scheduled
+            } else {
+                !is_submit_task_contract || clarification_active
+            };
+            if execute_call && is_request_user_input {
+                request_user_input_scheduled = true;
+            }
+            if execute_call && is_submit_task_contract {
+                submit_task_contract_scheduled = true;
+            }
+            let tool_future: BoxFuture<'static, CodexResult<ResponseInputItem>> = if execute_call {
+                Box::pin(
+                    tool_runtime
+                        .clone()
+                        .handle_tool_call(call, cancellation_token.child_token()),
+                )
+            } else {
+                let message = if clarification_active && !has_request_user_input {
+                    CLARIFICATION_DECISION_REQUIRED_MESSAGE
+                } else {
+                    USER_INPUT_REQUIRED_MESSAGE
+                };
+                Box::pin(std::future::ready(Ok(ToolCallRuntime::failure_response(
+                    call,
+                    FunctionCallError::RespondToModel(message.to_string()),
+                ))))
+            };
+            in_flight.push_back(Box::pin(async move {
+                (
+                    execute_call && is_request_user_input,
+                    execute_call && is_submit_task_contract,
+                    tool_future.await,
+                )
+            }));
+        }
+
+        let tool_blocking_timing_guard = if in_flight.is_empty() {
+            None
+        } else {
+            Some(turn_context.turn_timing_state.begin_tool_blocking())
+        };
+        let mut requested_user_input = false;
+        let mut task_candidate_review = if submit_task_contract_scheduled {
+            TaskCandidateReview::Invalid
+        } else {
+            TaskCandidateReview::NotAttempted
+        };
+        while let Some((is_request_user_input, is_submit_task_contract, result)) =
+            in_flight.next().await
+        {
+            match result {
+                Ok(response_input) => {
+                    let succeeded = tool_call_output_succeeded(&response_input);
+                    requested_user_input |= is_request_user_input && succeeded;
+                    if is_submit_task_contract {
+                        use crate::task_contract_review::TaskContractAssessment;
+                        use crate::task_contract_review::TaskContractReviewDecision;
+
+                        let assessment = match &response_input {
+                            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                                output.text_content().and_then(|text| {
+                                    serde_json::from_str::<TaskContractAssessment>(text).ok()
+                                })
+                            }
+                            _ => None,
+                        };
+                        task_candidate_review = if succeeded {
+                            TaskCandidateReview::Accepted
+                        } else if assessment.is_some_and(|assessment| {
+                            assessment.decision == TaskContractReviewDecision::Clarify
+                        }) {
+                            TaskCandidateReview::NeedsClarification
+                        } else {
+                            TaskCandidateReview::Invalid
+                        };
+                    }
+                    let response_item = response_input.into();
+                    sess.record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
+                    .await;
+                    mark_thread_memory_mode_polluted_if_external_context(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        &response_item,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    error_or_panic(format!(
+                        "in-flight clarification tool future failed during drain: {err}"
+                    ));
+                }
+            }
+        }
+        drop(tool_blocking_timing_guard);
+
+        let mut last_agent_message = None;
+        let mut answer_allowed = false;
+        if !has_tool_calls && !pending_assistant_messages.is_empty() {
+            if clarification_active {
+                let text = pending_assistant_messages
+                    .iter()
+                    .filter_map(crate::stream_events_utils::raw_assistant_output_text_from_item)
+                    .collect::<String>();
+                let review_result = crate::task_contract_review::audit_task_candidate(
+                    Arc::clone(&sess),
+                    Arc::clone(&turn_context),
+                    crate::task_contract_review::TaskCandidate::Answer { text },
+                    cancellation_token.child_token(),
+                )
+                .await;
+                task_candidate_review = match &review_result {
+                    Ok(assessment) => match assessment.decision {
+                        crate::task_contract_review::TaskContractReviewDecision::Allow => {
+                            TaskCandidateReview::Accepted
+                        }
+                        crate::task_contract_review::TaskContractReviewDecision::Clarify => {
+                            TaskCandidateReview::NeedsClarification
+                        }
+                    },
+                    Err(_) => TaskCandidateReview::Invalid,
+                };
+                match review_result
+                    .and_then(crate::task_contract_review::TaskContractAssessment::into_allowed)
+                {
+                    Ok(()) => answer_allowed = true,
+                    Err(message) => {
+                        let response_item = ResponseItem::Message {
+                            id: None,
+                            role: "developer".to_string(),
+                            content: vec![ContentItem::InputText { text: message }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        sess.record_conversation_items(
+                            &turn_context,
+                            std::slice::from_ref(&response_item),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                answer_allowed = true;
+            }
+        }
+        if answer_allowed {
+            last_agent_message = record_pending_assistant_messages(
+                pending_assistant_messages,
+                Arc::clone(&sess),
+                Arc::clone(&turn_context),
+                turn_store,
+                tool_runtime.clone(),
+                cancellation_token.child_token(),
+                true,
+            )
+            .await?;
+        }
+
+        let decision_missing = clarification_active
+            && !requested_user_input
+            && task_candidate_review != TaskCandidateReview::Accepted
+            && !answer_allowed;
+        if decision_missing {
+            let response_item = ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: CLARIFICATION_DECISION_REQUIRED_MESSAGE.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
+                .await;
+        }
+
+        Ok(ClarificationResponseResult {
+            requested_user_input,
+            task_candidate_review,
+            decision_missing,
+            last_agent_message,
+        })
+    })
+}
+
 fn assign_missing_streamed_response_item_id(
     item: &mut ResponseItem,
     active_item: Option<&TurnItem>,
@@ -2198,6 +2586,7 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    clarification_active: bool,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -2236,6 +2625,9 @@ async fn try_run_sampling_request(
         .await??;
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
+    let defer_tool_execution = task_contract_gate_enabled(&turn_context);
+    let mut deferred_response =
+        defer_tool_execution.then(|| Box::new(DeferredResponseState::default()));
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -2260,7 +2652,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let mut outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2362,6 +2754,14 @@ async fn try_run_sampling_request(
                 {
                     continue;
                 }
+                if defer_tool_execution
+                    && should_defer_assistant_message(&item, clarification_active)
+                {
+                    if let Some(state) = deferred_response.as_mut() {
+                        state.assistant_messages.push(item);
+                    }
+                    continue;
+                }
 
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
@@ -2369,6 +2769,7 @@ async fn try_run_sampling_request(
                     turn_store: Arc::clone(&turn_store),
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
+                    defer_tool_execution,
                 };
 
                 let preempt_for_mailbox_mail = match &item {
@@ -2393,16 +2794,24 @@ async fn try_run_sampling_request(
                     | ResponseItem::Other => false,
                 };
 
-                let output_result =
-                    match handle_output_item_done(&mut ctx, item, previously_streamed_item)
-                        .instrument(handle_responses)
-                        .await
-                    {
-                        Ok(output_result) => output_result,
-                        Err(err) => break Err(err),
-                    };
+                let output_result = match Box::pin(handle_output_item_done(
+                    &mut ctx,
+                    item,
+                    previously_streamed_item,
+                ))
+                .instrument(handle_responses)
+                .await
+                {
+                    Ok(output_result) => output_result,
+                    Err(err) => break Err(err),
+                };
                 if let Some(tool_future) = output_result.tool_future {
                     in_flight.push_back(tool_future);
+                }
+                if let Some(tool_call) = output_result.pending_tool_call
+                    && let Some(state) = deferred_response.as_mut()
+                {
+                    state.tool_calls.push(*tool_call);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -2413,6 +2822,8 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        requested_user_input: false,
+                        task_candidate_review: TaskCandidateReview::NotAttempted,
                     });
                 }
             }
@@ -2441,7 +2852,9 @@ async fn try_run_sampling_request(
                 .await
                 {
                     let mut turn_item = turn_item;
-                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
+                    let stream_item_to_client = !(defer_streamed_turn_items_for_contributors
+                        || defer_tool_execution
+                            && should_defer_assistant_message(&item, clarification_active));
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -2554,6 +2967,32 @@ async fn try_run_sampling_request(
                 token_usage,
                 end_turn,
             } => {
+                let waits_for_user_input = deferred_response
+                    .as_ref()
+                    .is_some_and(|state| state.tool_calls.iter().any(is_request_user_input_call));
+                let submits_task_contract = deferred_response
+                    .as_ref()
+                    .is_some_and(|state| state.tool_calls.iter().any(is_submit_task_contract_call));
+                if !waits_for_user_input && !submits_task_contract && !clarification_active {
+                    let assistant_messages = deferred_response
+                        .as_mut()
+                        .map(|state| std::mem::take(&mut state.assistant_messages))
+                        .unwrap_or_default();
+                    if let Some(agent_message) = record_pending_assistant_messages(
+                        assistant_messages,
+                        sess.clone(),
+                        turn_context.clone(),
+                        Arc::clone(&turn_store),
+                        tool_runtime.clone(),
+                        cancellation_token.child_token(),
+                        defer_tool_execution,
+                    )
+                    .instrument(handle_responses.clone())
+                    .await?
+                    {
+                        last_agent_message = Some(agent_message);
+                    }
+                }
                 sess.services
                     .analytics_events_client
                     .track_code_mode_tool_call(
@@ -2593,6 +3032,8 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    requested_user_input: false,
+                    task_candidate_review: TaskCandidateReview::NotAttempted,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -2753,6 +3194,29 @@ async fn try_run_sampling_request(
         &mut assistant_message_stream_parsers,
     )
     .await;
+
+    if defer_tool_execution {
+        let deferred_response = deferred_response.take().unwrap_or_default();
+        let clarification_response = finalize_clarification_response(
+            deferred_response.tool_calls,
+            deferred_response.assistant_messages,
+            clarification_active,
+            tool_runtime.clone(),
+            cancellation_token.child_token(),
+            sess.clone(),
+            turn_context.clone(),
+            Arc::clone(&turn_store),
+        )
+        .await?;
+        if let Ok(result) = &mut outcome {
+            result.requested_user_input = clarification_response.requested_user_input;
+            result.task_candidate_review = clarification_response.task_candidate_review;
+            result.needs_follow_up |= clarification_response.decision_missing;
+            if clarification_response.last_agent_message.is_some() {
+                result.last_agent_message = clarification_response.last_agent_message;
+            }
+        }
+    }
 
     let tool_blocking_timing_guard = if in_flight.is_empty() {
         None

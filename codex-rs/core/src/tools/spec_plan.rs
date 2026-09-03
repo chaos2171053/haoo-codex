@@ -26,6 +26,7 @@ use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::SendUserMessageAsyncHandler;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::SubmitTaskContractHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -64,6 +65,7 @@ use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::account::PlanType;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -123,6 +125,9 @@ pub(crate) fn build_tool_router(
     step_store: &ExtensionData,
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
 ) -> CodexResult<ToolRouter> {
+    if crate::task_contract_review::is_task_contract_reviewer(&turn_context.session_source) {
+        return Ok(ToolRouter::from_parts(ToolRegistry::default(), Vec::new()));
+    }
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let wait_for_environment_tool_config = session
@@ -1047,6 +1052,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             },
             ToolExposure::DirectModelOnly,
         );
+        if features.enabled(Feature::DefaultModeRequestUserInput)
+            && features.enabled(Feature::DefaultModeTaskContract)
+            && turn_context.mode == ModeKind::Default
+        {
+            registry.add_with_exposure(SubmitTaskContractHandler, ToolExposure::DirectModelOnly);
+        }
     }
 
     if !turn_context.session_source.is_non_root_agent()

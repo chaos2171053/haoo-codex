@@ -806,6 +806,26 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
 }
 
 #[tokio::test]
+async fn default_mode_task_contract_exposes_contract_submission() {
+    let enabled = probe(|turn| {
+        set_features(
+            turn,
+            &[
+                Feature::DefaultModeRequestUserInput,
+                Feature::DefaultModeTaskContract,
+            ],
+        );
+    })
+    .await;
+    enabled.assert_visible_contains(&["request_user_input", "submit_task_contract"]);
+    enabled.assert_registered_contains(&["request_user_input", "submit_task_contract"]);
+    assert_eq!(
+        enabled.exposure("submit_task_contract"),
+        ToolExposure::DirectModelOnly
+    );
+}
+
+#[tokio::test]
 async fn update_plan_tool_respects_config_gate() {
     let enabled = probe(|_| {}).await;
     enabled.assert_visible_contains(&["update_plan"]);

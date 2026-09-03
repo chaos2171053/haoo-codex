@@ -2027,6 +2027,11 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
         .features
         .enable(Feature::MemoryTool)
         .expect("memory tool feature is configurable");
+    config.experimental_request_user_input_enabled = true;
+    config
+        .features
+        .enable(Feature::DefaultModeRequestUserInput)?;
+    config.features.enable(Feature::DefaultModeTaskContract)?;
     let config = Arc::new(config);
     let models_manager = test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),

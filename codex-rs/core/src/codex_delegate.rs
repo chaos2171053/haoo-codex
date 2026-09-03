@@ -75,13 +75,20 @@ pub(crate) async fn run_codex_thread_interactive(
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let conversation_history = initial_history.unwrap_or(InitialHistory::New);
     let forked_from_thread_id = conversation_history.forked_from_id();
-    let user_instructions = LoadedUserInstructions {
-        instructions: parent_session.user_instructions().await,
-        warnings: Vec::new(),
-    };
     let session_source = SessionSource::SubAgent(subagent_source.clone());
     let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
-    let extensions = if is_guardian_reviewer {
+    let is_task_contract_reviewer =
+        crate::task_contract_review::is_task_contract_reviewer(&session_source);
+    let isolated_reviewer = is_guardian_reviewer || is_task_contract_reviewer;
+    let user_instructions = LoadedUserInstructions {
+        instructions: if isolated_reviewer {
+            None
+        } else {
+            parent_session.user_instructions().await
+        },
+        warnings: Vec::new(),
+    };
+    let extensions = if isolated_reviewer {
         codex_extension_api::empty_extension_registry()
     } else {
         Arc::clone(&parent_session.services.extensions)

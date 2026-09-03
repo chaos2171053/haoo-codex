@@ -11,6 +11,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use serde::Deserialize;
@@ -152,7 +153,11 @@ fn render_review_prompt<'a>(
     let messages = render_review_messages(items);
     let mut retained = messages.as_slice();
     loop {
-        let transcript = retained.join("\n");
+        let transcript = retained
+            .iter()
+            .map(|message| message.rendered.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let prompt = format!(
             "Review this candidate against the role-labelled conversation evidence.\n\n<conversation>\n{transcript}</conversation>\n\n<candidate>\n{serialized_candidate}\n</candidate>"
         );
@@ -162,7 +167,7 @@ fn render_review_prompt<'a>(
                 && let Some(evidence) = contract
                     .evidence
                     .iter()
-                    .find(|evidence| !transcript_supports_evidence(&transcript, evidence))
+                    .find(|evidence| !messages_support_evidence(retained, evidence))
             {
                 return Err(format!(
                     "task contract evidence is not present in user-provided conversation evidence: {evidence}. Copy a verbatim excerpt from the user's message or explicit answer, without adding attribution or paraphrasing."
@@ -179,7 +184,12 @@ fn render_review_prompt<'a>(
     }
 }
 
-fn render_review_messages<'a>(items: impl Iterator<Item = &'a ResponseItem>) -> Vec<String> {
+struct ReviewMessage {
+    rendered: String,
+    user_evidence: Vec<String>,
+}
+
+fn render_review_messages<'a>(items: impl Iterator<Item = &'a ResponseItem>) -> Vec<ReviewMessage> {
     let mut request_user_input_calls = HashMap::new();
     let mut messages = Vec::new();
     for item in items {
@@ -200,14 +210,28 @@ fn render_review_messages<'a>(items: impl Iterator<Item = &'a ResponseItem>) -> 
         } = item
             && let Some(question) = request_user_input_calls.remove(call_id.as_str())
         {
-            if let Ok(text) = serde_json::to_string(output) {
-                let text = guardian_truncate_text(&text, MAX_REVIEW_MESSAGE_TOKENS).0;
+            if let Some(text) = output.text_content()
+                && let Ok(mut response) = serde_json::from_str::<RequestUserInputResponse>(text)
+            {
+                let mut user_evidence = Vec::new();
+                for answer in response
+                    .answers
+                    .values_mut()
+                    .flat_map(|answer| &mut answer.answers)
+                {
+                    *answer = guardian_truncate_text(answer, MAX_REVIEW_MESSAGE_TOKENS).0;
+                    user_evidence.push(answer.clone());
+                }
                 let question = guardian_truncate_text(question, MAX_REVIEW_MESSAGE_TOKENS).0;
                 // Keep the pair in one history entry so retention cannot orphan the answer.
-                messages.push(format!(
-                    "assistant_question: {}\nuser_answer: {text}",
-                    serde_json::json!(question)
-                ));
+                messages.push(ReviewMessage {
+                    rendered: format!(
+                        "assistant_question: {}\nuser_answer: {}",
+                        serde_json::json!(question),
+                        serde_json::json!(response)
+                    ),
+                    user_evidence,
+                });
             }
             continue;
         }
@@ -219,7 +243,7 @@ fn render_review_messages<'a>(items: impl Iterator<Item = &'a ResponseItem>) -> 
     messages
 }
 
-fn render_review_item(item: &ResponseItem) -> Option<String> {
+fn render_review_item(item: &ResponseItem) -> Option<ReviewMessage> {
     match item {
         ResponseItem::Message { role, content, .. } if role == "user" || role == "assistant" => {
             let text = content
@@ -235,19 +259,26 @@ fn render_review_item(item: &ResponseItem) -> Option<String> {
                 return None;
             }
             let text = guardian_truncate_text(&text, MAX_REVIEW_MESSAGE_TOKENS).0;
-            Some(format!("{role}: {text}"))
+            Some(ReviewMessage {
+                rendered: format!("{role}: {}", serde_json::json!(text)),
+                user_evidence: if role == "user" {
+                    vec![text]
+                } else {
+                    Vec::new()
+                },
+            })
         }
         _ => None,
     }
 }
 
-fn transcript_supports_evidence(transcript: &str, evidence: &str) -> bool {
+fn messages_support_evidence(messages: &[ReviewMessage], evidence: &str) -> bool {
     let evidence = normalize_evidence(evidence);
     !evidence.is_empty()
-        && transcript
-            .lines()
-            .filter(|line| line.starts_with("user:") || line.starts_with("user_answer:"))
-            .map(normalize_evidence)
+        && messages
+            .iter()
+            .flat_map(|message| &message.user_evidence)
+            .map(|text| normalize_evidence(text))
             .any(|line| line.contains(&evidence))
 }
 

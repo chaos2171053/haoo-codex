@@ -1439,6 +1439,7 @@ pub(crate) fn build_guardian_review_session_config(
     for feature in [
         Feature::Collab,
         Feature::MultiAgentV2,
+        Feature::DefaultModeTaskContract,
         Feature::GuardianV2,
         Feature::CodexHooks,
         Feature::Apps,

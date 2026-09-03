@@ -160,8 +160,12 @@ async fn task_contract_answer_review_preserves_revision_state(
     Ok(())
 }
 
+#[test_case("Inspect the named file and report its first line.")]
+#[test_case("Please help with this file.\nInspect the named file and report its first line.")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::Result<()> {
+async fn task_contract_unlocks_tools_only_after_independent_review(
+    user_message: &str,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -228,7 +232,7 @@ async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Inspect the named file and report its first line.".to_string(),
+            text: user_message.to_string(),
             text_elements: Vec::new(),
         }]))
         .await?;
@@ -283,6 +287,7 @@ async fn task_contract_clarification_completes_before_work_starts(
     oversized_submission: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
+    const USER_NOTE: &str = "Only \"payments\".\nPath: C:\\work\\repo";
 
     let server = start_mock_server().await;
     let test = test_codex()
@@ -488,7 +493,7 @@ async fn task_contract_clarification_completes_before_work_starts(
                     "result": "Assess the proposal.",
                     "boundary": "Only the named proposal.",
                     "completion": "A focused assessment.",
-                    "evidence": ["Assess this proposal.", "Focused review (Recommended)"]
+                    "evidence": ["Assess this proposal.", "Focused review (Recommended)", USER_NOTE]
                 })
                 .to_string(),
             ),
@@ -539,7 +544,10 @@ async fn task_contract_clarification_completes_before_work_starts(
                 answers: HashMap::from([(
                     "scope".to_string(),
                     RequestUserInputAnswer {
-                        answers: vec!["Focused review (Recommended)".to_string()],
+                        answers: vec![
+                            "Focused review (Recommended)".to_string(),
+                            format!("user_note: {USER_NOTE}"),
+                        ],
                     },
                 )]),
             },

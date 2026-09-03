@@ -36,7 +36,7 @@ pub fn create_submit_task_contract_tool() -> ToolSpec {
             JsonSchema::array(
                 JsonSchema::string(None),
                 Some(
-                    "Short excerpts from the user's messages or explicit answers that support the result, boundary, and completion conditions."
+                    "Verbatim excerpts copied from the user's messages or explicit answers that support the result, boundary, and completion conditions. Do not add attribution or paraphrase."
                         .to_string(),
                 ),
             ),
@@ -45,7 +45,7 @@ pub fn create_submit_task_contract_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: SUBMIT_TASK_CONTRACT_TOOL_NAME.to_string(),
-        description: "Submit a candidate task contract for independent review before using work tools. Do not infer preferences, scope, or completion conditions that the user has not established. Ask the user when a remaining unknown would change any contract field."
+        description: "Submit a candidate task contract for independent review before using work tools. All four fields (result, boundary, completion, evidence) are required. Do not infer preferences, scope, or completion conditions that the user has not established. Ask the user when a remaining unknown would change any contract field. A clarify decision lists unsupported_decisions: ask only for the missing choices or remove unrequested additions before resubmitting."
             .to_string(),
         strict: false,
         defer_loading: None,

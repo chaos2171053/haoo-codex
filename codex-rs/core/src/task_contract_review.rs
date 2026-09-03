@@ -43,14 +43,14 @@ pub(crate) enum TaskCandidate {
     Answer { text: String },
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TaskContractReviewDecision {
     Allow,
     Clarify,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct TaskContractAssessment {
     pub(crate) decision: TaskContractReviewDecision,
     pub(crate) unsupported_decisions: Vec<String>,
@@ -103,7 +103,7 @@ pub(crate) async fn audit_task_candidate(
             .find(|evidence| !transcript_supports_evidence(&transcript, evidence))
     {
         return Err(format!(
-            "task contract evidence is not present in user-provided conversation evidence: {evidence}"
+            "task contract evidence is not present in user-provided conversation evidence: {evidence}. Copy a verbatim excerpt from the user's message or explicit answer, without adding attribution or paraphrasing."
         ));
     }
     let candidate = serde_json::to_string_pretty(&candidate)

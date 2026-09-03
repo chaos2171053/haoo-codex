@@ -4,6 +4,8 @@ use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -14,7 +16,11 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
+use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
+use test_case::test_case;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::Result<()> {
@@ -130,8 +136,12 @@ async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::
     Ok(())
 }
 
+#[test_case(false; "valid submission")]
+#[test_case(true; "repaired submission")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_scope_is_clarified_before_work_starts() -> anyhow::Result<()> {
+async fn task_contract_clarification_completes_before_work_starts(
+    repair_arguments: bool,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -149,6 +159,31 @@ async fn unsupported_scope_is_clarified_before_work_starts() -> anyhow::Result<(
         })
         .build(&server)
         .await?;
+
+    let mut repair_mocks = Vec::new();
+    if repair_arguments {
+        for (call_id, args) in [
+            (
+                "missing-result",
+                json!({"boundary": "Proposal", "completion": "Assessment", "evidence": ["Assess this proposal."]}),
+            ),
+            (
+                "invalid-evidence",
+                json!({"result": "Assess", "boundary": "Proposal", "completion": "Assessment", "evidence": ["The user said: Assess this proposal."]}),
+            ),
+        ] {
+            repair_mocks.push(
+                responses::mount_sse_once(
+                    &server,
+                    sse(vec![
+                        ev_function_call(call_id, "submit_task_contract", &args.to_string()),
+                        ev_completed(call_id),
+                    ]),
+                )
+                .await,
+            );
+        }
+    }
 
     let contract_mock = responses::mount_sse_once(
         &server,
@@ -212,14 +247,15 @@ async fn unsupported_scope_is_clarified_before_work_starts() -> anyhow::Result<(
             text_elements: Vec::new(),
         }]))
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::RequestUserInput(_))
+    let question = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(question) => Some(question.clone()),
+        _ => None,
     })
     .await;
-    test.codex.submit(Op::Interrupt).await?;
 
-    let requests = [contract_mock, reviewer_mock, question_mock]
+    let requests = repair_mocks
         .into_iter()
+        .chain([contract_mock, reviewer_mock, question_mock])
         .flat_map(|mock| mock.requests())
         .collect::<Vec<_>>();
     assert!(requests.iter().all(|request| {
@@ -232,6 +268,117 @@ async fn unsupported_scope_is_clarified_before_work_starts() -> anyhow::Result<(
         .find(|request| request.body_contains_text("organization-wide scope"))
         .expect("review feedback must return to the main model");
     assert!(question_request.body_contains_text("five-year horizon"));
+
+    if repair_arguments {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.body_contains_text("missing field `result`"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.body_contains_text("Copy a verbatim excerpt"))
+        );
+    }
+    for request in requests.iter().filter(|request| {
+        request.body_json()["client_metadata"]["x-openai-subagent"]
+            .as_str()
+            .is_none()
+    }) {
+        let body = request.body_json();
+        let names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["request_user_input", "submit_task_contract"]);
+    }
+
+    let clarified_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_function_call(
+                "clarified-contract",
+                "submit_task_contract",
+                &json!({
+                    "result": "Assess the proposal.",
+                    "boundary": "Only the named proposal.",
+                    "completion": "A focused assessment.",
+                    "evidence": ["Assess this proposal.", "Focused review (Recommended)"]
+                })
+                .to_string(),
+            ),
+            ev_completed("clarified-contract"),
+        ]),
+    )
+    .await;
+    let allow_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message(
+                "allow",
+                r#"{"decision":"allow","unsupported_decisions":[]}"#,
+            ),
+            ev_completed("allow"),
+        ]),
+    )
+    .await;
+    let work_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_function_call("work-call", "test_sync_tool", "{}"),
+            ev_completed("work"),
+        ]),
+    )
+    .await;
+    let final_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("final", "Focused assessment complete."),
+            ev_completed("final"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: question.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "scope".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Focused review (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        clarified_mock
+            .single_request()
+            .body_contains_text("Focused review (Recommended)")
+    );
+    assert!(
+        allow_mock
+            .single_request()
+            .body_contains_text("user_answer:")
+    );
+    assert!(
+        work_mock
+            .single_request()
+            .body_contains_text("clarified-contract")
+    );
+    let (content, _) = final_mock
+        .single_request()
+        .function_call_output_content_and_success("work-call")
+        .unwrap();
+    assert_eq!(content.as_deref(), Some("ok"));
 
     Ok(())
 }

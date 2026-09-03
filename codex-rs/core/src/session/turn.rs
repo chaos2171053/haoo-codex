@@ -146,13 +146,24 @@ const USER_INPUT_REQUIRED_MESSAGE: &str =
 const CLARIFICATION_DECISION_REQUIRED_MESSAGE: &str = "the task boundary is still locked; ask the user for the missing decision or call submit_task_contract with the result, boundary, completion condition, and supporting user evidence";
 const CLARIFICATION_DECISION_RETRY_LIMIT: u8 = 1;
 const REJECTED_TASK_CONTRACT_RETRY_LIMIT: u8 = 2;
+const INVALID_TASK_CONTRACT_RETRY_LIMIT: u8 = 2;
 const CLARIFICATION_DECISION_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly skipped the required decision";
 const TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because the model repeatedly submitted unsupported task contracts";
+const INVALID_TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE: &str = "clarification could not be completed because task contract submissions repeatedly failed validation or review execution";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskContractSubmission {
+    NotAttempted,
+    Invalid,
+    NeedsClarification,
+    Accepted,
+}
 
 #[derive(Default)]
 struct ClarificationRetryState {
     missing_decisions: u8,
     rejected_contracts: u8,
+    invalid_contracts: u8,
 }
 
 fn is_request_user_input_call(call: &ToolCall) -> bool {
@@ -187,13 +198,15 @@ fn is_final_assistant_message(item: &ResponseItem) -> bool {
 fn update_clarification_decision_retries(
     clarification_active: bool,
     requested_user_input: bool,
-    attempted_task_contract: bool,
-    submitted_task_contract: bool,
+    task_contract_submission: TaskContractSubmission,
     retries: &mut ClarificationRetryState,
 ) -> CodexResult<()> {
-    if !clarification_active || requested_user_input || submitted_task_contract {
+    if !clarification_active
+        || requested_user_input
+        || task_contract_submission == TaskContractSubmission::Accepted
+    {
         *retries = ClarificationRetryState::default();
-    } else if attempted_task_contract {
+    } else if task_contract_submission == TaskContractSubmission::NeedsClarification {
         retries.missing_decisions = 0;
         if retries.rejected_contracts >= REJECTED_TASK_CONTRACT_RETRY_LIMIT {
             return Err(CodexErr::InvalidRequest(
@@ -201,6 +214,14 @@ fn update_clarification_decision_retries(
             ));
         }
         retries.rejected_contracts += 1;
+    } else if task_contract_submission == TaskContractSubmission::Invalid {
+        retries.missing_decisions = 0;
+        if retries.invalid_contracts >= INVALID_TASK_CONTRACT_RETRY_LIMIT {
+            return Err(CodexErr::InvalidRequest(
+                INVALID_TASK_CONTRACT_RETRY_EXHAUSTED_MESSAGE.to_string(),
+            ));
+        }
+        retries.invalid_contracts += 1;
     } else {
         if retries.missing_decisions >= CLARIFICATION_DECISION_RETRY_LIMIT {
             return Err(CodexErr::InvalidRequest(
@@ -476,19 +497,17 @@ pub(crate) async fn run_turn(
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                     requested_user_input,
-                    attempted_task_contract,
-                    submitted_task_contract,
+                    task_contract_submission,
                 } = sampling_request_output;
                 update_clarification_decision_retries(
                     clarification_active,
                     requested_user_input,
-                    attempted_task_contract,
-                    submitted_task_contract,
+                    task_contract_submission,
                     &mut clarification_decision_retries,
                 )?;
                 if requested_user_input {
                     clarification_active = true;
-                } else if submitted_task_contract {
+                } else if task_contract_submission == TaskContractSubmission::Accepted {
                     clarification_active = false;
                 }
                 if model_needs_follow_up {
@@ -1691,8 +1710,7 @@ struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
     requested_user_input: bool,
-    attempted_task_contract: bool,
-    submitted_task_contract: bool,
+    task_contract_submission: TaskContractSubmission,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2274,8 +2292,7 @@ async fn drain_in_flight(
 
 struct ClarificationResponseResult {
     requested_user_input: bool,
-    attempted_task_contract: bool,
-    submitted_task_contract: bool,
+    task_contract_submission: TaskContractSubmission,
     decision_missing: bool,
     last_agent_message: Option<String>,
 }
@@ -2391,7 +2408,11 @@ fn finalize_clarification_response(
             Some(turn_context.turn_timing_state.begin_tool_blocking())
         };
         let mut requested_user_input = false;
-        let mut submitted_task_contract = false;
+        let mut task_contract_submission = if submit_task_contract_scheduled {
+            TaskContractSubmission::Invalid
+        } else {
+            TaskContractSubmission::NotAttempted
+        };
         while let Some((is_request_user_input, is_submit_task_contract, result)) =
             in_flight.next().await
         {
@@ -2399,7 +2420,28 @@ fn finalize_clarification_response(
                 Ok(response_input) => {
                     let succeeded = tool_call_output_succeeded(&response_input);
                     requested_user_input |= is_request_user_input && succeeded;
-                    submitted_task_contract |= is_submit_task_contract && succeeded;
+                    if is_submit_task_contract {
+                        use crate::task_contract_review::TaskContractAssessment;
+                        use crate::task_contract_review::TaskContractReviewDecision;
+
+                        let assessment = match &response_input {
+                            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                                output.text_content().and_then(|text| {
+                                    serde_json::from_str::<TaskContractAssessment>(text).ok()
+                                })
+                            }
+                            _ => None,
+                        };
+                        task_contract_submission = if succeeded {
+                            TaskContractSubmission::Accepted
+                        } else if assessment.is_some_and(|assessment| {
+                            assessment.decision == TaskContractReviewDecision::Clarify
+                        }) {
+                            TaskContractSubmission::NeedsClarification
+                        } else {
+                            TaskContractSubmission::Invalid
+                        };
+                    }
                     let response_item = response_input.into();
                     sess.record_conversation_items(
                         &turn_context,
@@ -2474,7 +2516,7 @@ fn finalize_clarification_response(
 
         let decision_missing = clarification_active
             && !requested_user_input
-            && !submitted_task_contract
+            && task_contract_submission != TaskContractSubmission::Accepted
             && !answer_allowed;
         if decision_missing {
             let response_item = ResponseItem::Message {
@@ -2492,8 +2534,7 @@ fn finalize_clarification_response(
 
         Ok(ClarificationResponseResult {
             requested_user_input,
-            attempted_task_contract: submit_task_contract_scheduled,
-            submitted_task_contract,
+            task_contract_submission,
             decision_missing,
             last_agent_message,
         })
@@ -2767,8 +2808,7 @@ async fn try_run_sampling_request(
                         needs_follow_up: true,
                         last_agent_message,
                         requested_user_input: false,
-                        attempted_task_contract: false,
-                        submitted_task_contract: false,
+                        task_contract_submission: TaskContractSubmission::NotAttempted,
                     });
                 }
             }
@@ -2977,8 +3017,7 @@ async fn try_run_sampling_request(
                     needs_follow_up,
                     last_agent_message,
                     requested_user_input: false,
-                    attempted_task_contract: false,
-                    submitted_task_contract: false,
+                    task_contract_submission: TaskContractSubmission::NotAttempted,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3155,8 +3194,7 @@ async fn try_run_sampling_request(
         .await?;
         if let Ok(result) = &mut outcome {
             result.requested_user_input = clarification_response.requested_user_input;
-            result.attempted_task_contract = clarification_response.attempted_task_contract;
-            result.submitted_task_contract = clarification_response.submitted_task_contract;
+            result.task_contract_submission = clarification_response.task_contract_submission;
             result.needs_follow_up |= clarification_response.decision_missing;
             if clarification_response.last_agent_message.is_some() {
                 result.last_agent_message = clarification_response.last_agent_message;

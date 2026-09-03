@@ -1,5 +1,6 @@
 use crate::function_tool::FunctionCallError;
 use crate::task_contract_review::TaskCandidate;
+use crate::task_contract_review::TaskContractReviewDecision;
 use crate::task_contract_review::audit_task_candidate;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -47,9 +48,17 @@ impl ToolExecutor<ToolInvocation> for SubmitTaskContractHandler {
             )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
-            assessment
-                .into_allowed()
-                .map_err(FunctionCallError::RespondToModel)?;
+            if assessment.decision == TaskContractReviewDecision::Clarify {
+                let content = serde_json::to_string(&assessment).map_err(|err| {
+                    FunctionCallError::Fatal(format!(
+                        "failed to serialize task contract assessment: {err}"
+                    ))
+                })?;
+                return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                    content,
+                    Some(false),
+                )));
+            }
             let content = serde_json::to_string(&args).map_err(|err| {
                 FunctionCallError::Fatal(format!(
                     "failed to serialize {SUBMIT_TASK_CONTRACT_TOOL_NAME} response: {err}"

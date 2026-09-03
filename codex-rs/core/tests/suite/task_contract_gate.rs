@@ -274,11 +274,13 @@ async fn task_contract_unlocks_tools_only_after_independent_review() -> anyhow::
     Ok(())
 }
 
-#[test_case(false; "valid submission")]
-#[test_case(true; "repaired submission")]
+#[test_case(false, false; "valid submission")]
+#[test_case(true, false; "repaired submission")]
+#[test_case(false, true; "oversized submission")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_contract_clarification_completes_before_work_starts(
     repair_arguments: bool,
+    oversized_submission: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -299,6 +301,27 @@ async fn task_contract_clarification_completes_before_work_starts(
         .await?;
 
     let mut repair_mocks = Vec::new();
+    if oversized_submission {
+        repair_mocks.push(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_function_call(
+                        "oversized-contract",
+                        "submit_task_contract",
+                        &json!({
+                            "result": "Assess this proposal. ".repeat(3_000),
+                            "boundary": "Proposal", "completion": "Assessment",
+                            "evidence": ["Assess this proposal."]
+                        })
+                        .to_string(),
+                    ),
+                    ev_completed("oversized-contract"),
+                ]),
+            )
+            .await,
+        );
+    }
     if repair_arguments {
         for (call_id, args) in [
             (
@@ -417,6 +440,16 @@ async fn task_contract_clarification_completes_before_work_starts(
         .find(|request| request.body_contains_text("organization-wide scope"))
         .expect("review feedback must return to the main model");
     assert!(question_request.body_contains_text("five-year horizon"));
+    if oversized_submission {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.body_contains_text("shorten the candidate"))
+        );
+        assert!(requests.iter().filter(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str().is_some()
+        }).all(|request| !request.body_contains_text(&"Assess this proposal. ".repeat(3_000))));
+    }
 
     if repair_arguments {
         assert!(
@@ -534,6 +567,16 @@ async fn task_contract_clarification_completes_before_work_starts(
         allow_mock
             .single_request()
             .body_contains_text("user_answer:")
+    );
+    assert!(
+        allow_mock
+            .single_request()
+            .body_contains_text("assistant_question:")
+    );
+    assert!(
+        allow_mock
+            .single_request()
+            .body_contains_text("What scope and deliverable do you want?")
     );
     assert!(
         work_mock
